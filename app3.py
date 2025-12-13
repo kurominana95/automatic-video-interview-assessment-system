@@ -269,7 +269,7 @@ def score_text_for_question(qid: int, text: str):
 @st.cache_resource
 def load_whisper():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    return whisper.load_model("medium").to(device)
+    return whisper.load_model("small").to(device)
 
 # =========================
 # Streamlit UI
@@ -388,3 +388,4 @@ if st.button("Proses semua video"):
         file_name="RESULT.json",
         mime="application/json"
     )
+
