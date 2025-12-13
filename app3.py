@@ -11,6 +11,11 @@ import torch
 from io import BytesIO
 
 # =========================
+# BATASI THREAD (WAJIB)
+# =========================
+torch.set_num_threads(1)
+
+# =========================
 # Pertanyaan
 # =========================
 QUESTIONS = {
@@ -191,11 +196,9 @@ os.makedirs(AUD_DIR, exist_ok=True)
 # Convert ke WAV
 # =========================
 def convert_to_wav(input_bytes, wav_path):
-    """
-    input_bytes: BytesIO atau buffer file video
-    """
     with open("temp_video_file", "wb") as f:
         f.write(input_bytes.read())
+
     (
         ffmpeg
         .input("temp_video_file")
@@ -203,7 +206,7 @@ def convert_to_wav(input_bytes, wav_path):
         .overwrite_output()
         .run(quiet=True)
     )
-    os.remove("temp_video_file")  # hapus sementara
+    os.remove("temp_video_file")
 
 # =========================
 # Confidence helpers
@@ -268,124 +271,85 @@ def score_text_for_question(qid: int, text: str):
 # =========================
 @st.cache_resource
 def load_whisper():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    return whisper.load_model("small").to(device)
+    return whisper.load_model("base")
 
 # =========================
 # Streamlit UI
 # =========================
 st.title("Automatic Video Interview Assessment System")
 
-final_payload = {
-    "assessorProfile": {
-        "id": 47,
-        "name": "AutoSystem",
-        "photoURL": "auto.png"
-    },
-    "videos": [],
-    "videoCheck": [],
-    "reviewChecklistResult": {
-        "interview": {
-            "minScore": 0,
-            "maxScore": 4,
-            "scores": []
-        }
-    },
-    "overallNotes": "Interview responses appear consistent."
-}
+if "processing" not in st.session_state:
+    st.session_state.processing = False
 
 uploaded_files = {}
 
-# Upload video satu per satu
+MAX_MB = 40
+
 for qid, qtext in QUESTIONS.items():
-    uploaded_file = st.file_uploader(
+    f = st.file_uploader(
         f"Upload video untuk pertanyaan {qid}: {qtext}",
         type=["mp4", "webm", "mov"],
         key=f"upload_{qid}"
     )
-    uploaded_files[qid] = uploaded_file
 
-# Tombol proses semua video
-if st.button("Proses semua video"):
+    if f and f.size > MAX_MB * 1024 * 1024:
+        st.error(f"Ukuran maksimal video {MAX_MB} MB")
+        st.stop()
+
+    uploaded_files[qid] = f
+
+# =========================
+# PROSES
+# =========================
+if st.button("Proses semua video", disabled=st.session_state.processing):
+    st.session_state.processing = True
     model = load_whisper()
-    total_score = 0
+
+    final_payload = {
+        "videos": [],
+        "reviewChecklistResult": {"interview": {"scores": []}},
+        "total_score": 0
+    }
+
     start_all = time.time()
 
-    for qid, uploaded_file in uploaded_files.items():
-        if uploaded_file is None:
-            st.warning(f"Video untuk pertanyaan {qid} belum diupload.")
+    for qid, f in uploaded_files.items():
+        if f is None:
             continue
 
-        # Convert ke WAV
         wav_path = os.path.join(AUD_DIR, f"audio_{qid}.wav")
-        convert_to_wav(BytesIO(uploaded_file.getbuffer()), wav_path)
+        convert_to_wav(BytesIO(f.getbuffer()), wav_path)
 
-        # Transcribe
         t0 = time.time()
-        res = model.transcribe(wav_path, language="en", verbose=False, condition_on_previous_text=False)
+        res = model.transcribe(wav_path, language="en", verbose=False)
         t1 = time.time()
-        transcribe_time = t1 - t0
 
-        # Bersihkan segmen
-        cleaned_segments = []
-        prev = ""
-        for seg in res["segments"]:
-            segt = seg["text"].strip()
-            if segt != prev:
-                cleaned_segments.append(segt)
-                prev = segt
-        transcript = " ".join(" ".join(cleaned_segments).split())
+        os.remove(wav_path)  # 🔥 KRUSIAL
+
+        transcript = " ".join([s["text"].strip() for s in res["segments"]])
         conf = overall_confidence_from_segments(res["segments"])
-
-        # Score rubrik
         score, reason, evidence = score_text_for_question(qid, transcript)
-        total_score += score
 
-        # Tambahkan ke final_payload["videos"]
         final_payload["videos"].append({
             "question_id": qid,
-            "question": QUESTIONS[qid],
-            "video_file": uploaded_file.name,
             "transcript": transcript,
             "confidence": conf,
             "score": score,
             "reason": reason,
             "evidence": evidence,
-            "transcription_time_sec": round(transcribe_time, 2)
+            "time_sec": round(t1 - t0, 2)
         })
 
-        # Tambahkan ke videoCheck
-        final_payload["videoCheck"].append({
-            "file_name": uploaded_file.name,
-            "isExist": 1,
-            "source_link": "uploaded_file"
-        })
-
-        # Tambahkan skor ke checklist
         final_payload["reviewChecklistResult"]["interview"]["scores"].append(score)
+        final_payload["total_score"] += score
 
-    # Tambahkan summary dan keputusan
-    end_all = time.time()
-    final_payload["total_score"] = total_score
-    final_payload["total_process_time_sec"] = round(end_all - start_all, 2)
-    final_payload["decision"] = "Need Human" if total_score < 16 else "PASSED"
-    final_payload["scoresOverview"] = {
-        "project": 100,
-        "interview": total_score,
-        "total": 94.3
-    }
+    final_payload["total_time_sec"] = round(time.time() - start_all, 2)
+    st.session_state.processing = False
 
-    # Simpan JSON
-    json_path = os.path.join("output", "RESULT.json")
-    os.makedirs("output", exist_ok=True)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(final_payload, f, indent=2)
-
-    st.success("Semua video diproses dan JSON siap diunduh!")
+    st.success("Proses selesai")
     st.download_button(
-        label="Download JSON",
-        data=json.dumps(final_payload, indent=2),
-        file_name="RESULT.json",
-        mime="application/json"
+        "Download JSON",
+        json.dumps(final_payload, indent=2),
+        "RESULT.json",
+        "application/json"
     )
-
